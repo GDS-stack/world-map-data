@@ -1,6 +1,6 @@
 // wm-ripple-gl-standalone.js
-// Standalone WebGL2 ripple renderer (no OGL / no external libs)
-// Export: default async function initRipple(options)
+// Standalone WebGL2 ripple renderer (no external libs)
+// Exports: default async function initRipple(options)
 
 function cssHexToLinearRGB(hex) {
   const c = hex.replace('#', '').trim();
@@ -49,16 +49,16 @@ export default async function initRipple(opts = {}) {
     dataUrl = '',
 
     // Visual/behavior
-    targetDotPx = 4,      // approx on-screen “pixel” size of each square
-    cornerPct   = 0.12,   // 0..1 (we remap to 0..0.5 in shader)
+    targetDotPx = 4,      // ~ on-screen size of each square (CSS px)
+    cornerPct   = 0.12,   // 0..1 (mapped to 0..0.5 in shader)
     seedFraction= 0.20,   // fraction of points acting as ripple origins
     cycleSec    = 10,     // time for one ripple cycle
     rngJitter   = 0.5,    // seconds of random phase jitter
     maxSeeds    = 64,     // cap seeds
 
-    // Perf knobs (optional)
+    // Perf knobs
     dprCap      = 2.0,    // clamp devicePixelRatio (e.g., 1.5–2.0)
-    fpsCap      = 0,      // 0 = uncapped; otherwise e.g., 45 or 30
+    fpsCap      = 0,      // 0 = uncapped; otherwise 30–60 typical
   } = opts;
 
   // 1) Canvas + WebGL2
@@ -84,10 +84,7 @@ export default async function initRipple(opts = {}) {
   const BRIGHT = cssHexToLinearRGB(brightHex);
 
   // 3) Load grid data
-  if (!dataUrl) {
-    console.error('[wm] dataUrl is required.');
-    return;
-  }
+  if (!dataUrl) { console.error('[wm] dataUrl is required.'); return; }
   let pts;
   try {
     const res = await fetch(dataUrl, { cache: 'no-store' });
@@ -116,7 +113,7 @@ export default async function initRipple(opts = {}) {
   const vbW = (maxX - minX) + pad * 2;
   const vbH = (maxY - minY) + pad * 2;
 
-  // 5) Choose seeds (origins) and per-instance delays
+  // 5) Seeds (origins) + delays computed from ORIGINAL positions (stable phase)
   const indices = Array.from(pts.keys());
   for (let i = indices.length - 1; i > 0; i--) {
     const j = (Math.random() * (i + 1)) | 0;
@@ -132,14 +129,11 @@ export default async function initRipple(opts = {}) {
   const waveSpeed = diag / (cycleSec * 0.60); // traverse ~60% of bbox per cycle
 
   const N = pts.length;
-  const instCenters = new Float32Array(N * 2);
   const instDelay   = new Float32Array(N);
 
+  // delays use original positions to avoid phase jumps on resize
   for (let i = 0; i < N; i++) {
     const p = pts[i];
-    instCenters[i * 2 + 0] = p.x;
-    instCenters[i * 2 + 1] = p.y;
-
     // nearest seed → distance → travel time
     let best = Infinity, bestIdx = 0;
     for (let s = 0; s < seeds.length; s++) {
@@ -171,7 +165,7 @@ export default async function initRipple(opts = {}) {
 
   const centerBuf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, centerBuf);
-  gl.bufferData(gl.ARRAY_BUFFER, instCenters, gl.STATIC_DRAW);
+  // we'll fill centerBuf after we compute quantized centers (depends on canvas size)
 
   const delayBuf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, delayBuf);
@@ -180,7 +174,7 @@ export default async function initRipple(opts = {}) {
   // 7) Shaders (GLSL ES 3.00)
   const vertSrc = `#version 300 es
     layout(location=0) in vec2 aPos;     // quad vertex (-0.5..0.5)
-    layout(location=1) in vec2 aCenter;  // instance center (data units)
+    layout(location=1) in vec2 aCenter;  // instance center (data units, quantized)
     layout(location=2) in float aDelay;  // instance delay (seconds)
 
     uniform vec3 uBounds;  // (vbX, vbY, dotSizeData)
@@ -212,8 +206,8 @@ export default async function initRipple(opts = {}) {
 
     out vec4 outColor;
 
+    // Rounded-rect mask in local coords [-0.5,0.5]
     float roundedRectMask(vec2 uv, float corner){
-      // uv in [-0.5,0.5]
       vec2 a = abs(uv) - 0.5 + vec2(corner);
       float outside = max(a.x, a.y);
       float m = step(outside, 0.0);
@@ -223,8 +217,9 @@ export default async function initRipple(opts = {}) {
       return m;
     }
 
+    // Ripple brightness window:
+    //   ~3% fade-in → 7% hold → 90% fade-out
     float rippleWindow(float tNorm){
-      // ~3% fade-in → 7% hold → 90% fade-out
       if (tNorm < 0.03) return smoothstep(0.0, 0.03, tNorm);
       else if (tNorm < 0.10) return 1.0;
       float k = (tNorm - 0.10) / 0.90;
@@ -286,9 +281,10 @@ export default async function initRipple(opts = {}) {
 
   // Transform mapping data space -> NDC (like SVG viewBox; Y up)
   let dotSizeData = 1;
+
   function updateTransforms() {
     const sx =  2.0 / vbW;
-    const sy = -2.0 / vbH; // flip Y for typical screen coordinates
+    const sy = -2.0 / vbH; // flip Y to screen coords
     const ox = -1.0 - vbX * sx;
     const oy =  1.0 - vbY * sy;
     gl.uniform3f(uBounds, vbX, vbY, dotSizeData);
@@ -296,11 +292,27 @@ export default async function initRipple(opts = {}) {
     gl.uniform2f(uOffset, ox, oy);
   }
 
+  // === Quantized centers (CPU) for pixel-perfect alignment ===
+  // We keep original pts immutable for delay math (no phase jumps).
+  const instCentersQuant = new Float32Array(N * 2);
+
+  function updateQuantizedCenters(devicePixelsPerDataX) {
+    // Quant step in data units that corresponds to 1 device pixel along X.
+    const quant = 1 / Math.max(devicePixelsPerDataX, 1e-6);
+    for (let i = 0; i < N; i++) {
+      const p = pts[i];
+      instCentersQuant[i * 2 + 0] = Math.round(p.x / quant) * quant;
+      instCentersQuant[i * 2 + 1] = Math.round(p.y / quant) * quant;
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, centerBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, instCentersQuant, gl.STATIC_DRAW);
+  }
+
   // Responsive sizing
   function resize() {
     const rect = canvas.getBoundingClientRect();
     const dprRaw = Math.max(1, window.devicePixelRatio || 1);
-    const dpr = Math.min(dprCap || dprRaw, dprRaw);
+    const dpr = Math.min(dprCap || dprRaw, dprRaw); // clamp DPI for perf
     const w = Math.max(1, Math.round(rect.width  * dpr));
     const h = Math.max(1, Math.round(rect.height * dpr));
     if (canvas.width !== w || canvas.height !== h) {
@@ -308,8 +320,16 @@ export default async function initRipple(opts = {}) {
       canvas.height = h;
       gl.viewport(0, 0, w, h);
     }
-    const pxPerDataX = (rect.width || 1) / vbW;
-    dotSizeData = targetDotPx / Math.max(pxPerDataX, 1e-6);
+
+    // dotSizeData: size in DATA units that will become ~targetDotPx in CSS px.
+    // Use CSS width (rect.width) for perceived size control:
+    const pxPerDataX_css = (rect.width || 1) / vbW;
+    dotSizeData = targetDotPx / Math.max(pxPerDataX_css, 1e-6);
+
+    // BUT for **pixel snapping**, quantize by **device pixels**:
+    const devicePixelsPerDataX = (canvas.width || 1) / vbW;
+    updateQuantizedCenters(devicePixelsPerDataX);
+
     updateTransforms();
   }
   window.addEventListener('resize', resize, { passive: true });
